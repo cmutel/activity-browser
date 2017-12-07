@@ -51,6 +51,10 @@ class DatabaseImportWizard(QtWidgets.QWizard):
         # db import is done when finish button becomes active
         self.button(QtWidgets.QWizard.FinishButton).clicked.connect(self.reject)
 
+        # threads
+        self.active_thread = []
+        self.button(QtWidgets.QWizard.CancelButton).clicked.connect(self.exit_thread)
+
     @property
     def version(self):
         return self.ecoinvent_version_page.version_combobox.currentText()
@@ -70,8 +74,16 @@ class DatabaseImportWizard(QtWidgets.QWizard):
         close event now behaves similarly to cancel, because of self.reject
         like this the db wizard can be reused, ie starts from the beginning
         '''
+        self.exit_thread()
         self.reject()
         event.accept()
+
+    def exit_thread(self):
+        print(self.active_thread)
+        print('should be exiting here')
+
+        # shouldn't forcibly terminate
+        # self.active_thread.terminate()
 
 
 class ImportTypePage(QtWidgets.QWizardPage):
@@ -353,17 +365,36 @@ class ImportPage(QtWidgets.QWizardPage):
             self.unarchive_progressbar.setMaximum(1)
             self.tempdir = tempfile.TemporaryDirectory()
             self.archivepath = os.path.join(self.tempdir.name, 'db.7z')
-            import_signals.download_complete.connect(self.unarchive)
-            self.download_thread = DownloadThread(
-                session, self.wizard.db_url, self.tempdir.name)
-            import_signals.download_complete.connect(self.download_thread.exit)
-            self.download_thread.start()
+            self.download()
+
+    def download(self):
+        print('download thread started')
+        import_signals.download_complete.connect(self.unarchive)
+        self.download_thread = DownloadThread(
+            session, self.wizard.db_url, self.tempdir.name)
+        import_signals.download_complete.connect(self.download_thread.exit)
+        self.download_thread.start()
+        self.wizard.active_thread = self.download_thread
 
     def unarchive(self):
+        print('unarchive thread started')
         self.unarchive_thread = UnarchiveWorkerThread(self.archivepath, self.tempdir.name)
         import_signals.unarchive_finished.connect(self.unarchive_thread.exit)
         import_signals.unarchive_finished.connect(self.import_dir)
         self.unarchive_thread.start()
+        self.wizard.active_thread = self.unarchive_thread
+
+    def import_dir(self):
+        print('import thread started')
+        db_name = self.field('db_name')
+        if self.wizard.import_type == 'directory':
+            dirpath = self.field('dirpath')
+        else:
+            dirpath = os.path.join(self.tempdir.name, 'datasets')
+        self.worker_thread = ImportWorkerThread(dirpath, db_name)
+        import_signals.finished.connect(self.worker_thread.exit)
+        self.worker_thread.start()
+        self.wizard.active_thread = self.worker_thread
 
     @QtCore.pyqtSlot(int, int)
     def update_extraction_progress(self, i, tot):
@@ -406,16 +437,6 @@ class ImportPage(QtWidgets.QWizardPage):
         self.unarchive_progressbar.setMaximum(0)
         self.unarchive_progressbar.setValue(0)
 
-    def import_dir(self):
-        db_name = self.field('db_name')
-        if self.wizard.import_type == 'directory':
-            dirpath = self.field('dirpath')
-        else:
-            dirpath = os.path.join(self.tempdir.name, 'datasets')
-        self.worker_thread = ImportWorkerThread(dirpath, db_name)
-        import_signals.finished.connect(self.worker_thread.exit)
-        self.worker_thread.start()
-
 
 class DownloadThread(QtCore.QThread):
     def __init__(self, session, db_url, tempdir):
@@ -423,6 +444,7 @@ class DownloadThread(QtCore.QThread):
         self.session = session
         self.db_url = db_url
         self.tempdir = tempdir
+        self.finished.connect(lambda: print('download thread finished'))
 
     def run(self):
         file_content = self.session.get(self.db_url).content
@@ -436,6 +458,7 @@ class UnarchiveWorkerThread(QtCore.QThread):
         super().__init__()
         self.archivepath = archivepath
         self.tempdir = tempdir
+        self.finished.connect(lambda: print('unarchive thread finished'))
 
     def run(self):
         patoolib.extract_archive(self.archivepath, outdir=self.tempdir)
@@ -447,6 +470,7 @@ class ImportWorkerThread(QtCore.QThread):
         super().__init__()
         self.dirpath = dirpath
         self.db_name = db_name
+        self.finished.connect(lambda: print('import thread finished'))
 
     def run(self):
         importer = ActivityBrowserImporter(self.dirpath, self.db_name)
